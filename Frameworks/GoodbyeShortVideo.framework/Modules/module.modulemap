@@ -1,0 +1,6 @@
+framework module GoodbyeShortVideo {
+  umbrella header "GoodbyeShortVideo.h"
+  export *
+
+  module * { export * }
+}

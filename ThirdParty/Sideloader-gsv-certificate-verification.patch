@@ -1,0 +1,250 @@
+diff --git a/build-macos-cli.sh b/build-macos-cli.sh
+index a1d52e1..f4a0bf9 100755
+--- a/build-macos-cli.sh
++++ b/build-macos-cli.sh
+@@ -15,6 +15,31 @@ source "$LDC_ACTIVATE"
+ cd "$ROOT/frontends/cli"
+ dub build --compiler=ldc2 --build=release
+ BIN="$ROOT/bin/sideloader"
++
++# LDC embeds source locations in its runtime diagnostics even for release
++# builds. Replace the local home-directory prefix without changing byte
++# lengths, so the distributed binary does not disclose the builder's account.
++python3 - "$BIN" "$HOME" <<'PY'
++from pathlib import Path
++import sys
++
++binary = Path(sys.argv[1])
++home = sys.argv[2].encode()
++if len(home) < len(b"/build"):
++    raise SystemExit("home directory path is too short to sanitize")
++
++replacement = b"/build" + b"_" * (len(home) - len(b"/build"))
++data = binary.read_bytes()
++binary.write_bytes(data.replace(home, replacement))
++PY
++
++codesign --force --sign - "$BIN"
++
++if LC_ALL=C strings -a "$BIN" | grep -F -- "$HOME" >/dev/null; then
++  echo "failed to remove local build paths from $BIN" >&2
++  exit 1
++fi
++
+ chmod +x "$BIN" "$ROOT/sideloader"
+ echo "built $BIN (run via $ROOT/sideloader)"
+ otool -L "$BIN"
+diff --git a/frontends/cli/source/certificate.d b/frontends/cli/source/certificate.d
+index 0e9b958..0b53017 100644
+--- a/frontends/cli/source/certificate.d
++++ b/frontends/cli/source/certificate.d
+@@ -24,6 +24,7 @@ import argparse;
+ 
+ import plist;
+ import server.developersession;
++import sideload.certificateidentity;
+ 
+ import cli_frontend;
+ 
+@@ -35,13 +36,58 @@ struct CertificateCommand
+         return cmd.match!(
+                 (ListCerts cmd) => cmd(),
+                 (HistoryCerts cmd) => cmd(),
++                (VerifyCert cmd) => cmd(),
+                 (SubmitCert cmd) => cmd(),
+                 (RevokeCert cmd) => cmd()
+         );
+     }
+ 
+     @SubCommands
+-    SumType!(ListCerts, HistoryCerts, SubmitCert, RevokeCert) cmd;
++    SumType!(ListCerts, HistoryCerts, VerifyCert, SubmitCert, RevokeCert) cmd;
++}
++
++@(Command("verify").Description("Verify a saved signing certificate is still registered for a team."))
++struct VerifyCert
++{
++    mixin LoginCommand;
++
++    @(NamedArgument("team").Description("Apple Developer Team ID.").Required())
++    string teamId;
++
++    @(NamedArgument("gsv").Description("Emit a machine-readable verification result for GSV."))
++    bool gsv = false;
++
++    int opCall()
++    {
++        auto log = getLogger();
++        string configurationPath = systemConfigurationPath();
++
++        scope provisioningData = initializeADI(configurationPath);
++        scope adi = provisioningData.adi;
++        scope akDevice = provisioningData.device;
++        auto appleAccount = login(akDevice, adi);
++        if (!appleAccount) {
++            return 1;
++        }
++
++        auto teams = appleAccount.listTeams().unwrap().filter!((team) => team.teamId == teamId).array();
++        if (teams.empty) {
++            log.error("The selected Apple Developer team is no longer available.");
++            return 1;
++        }
++
++        try {
++            scope identity = new CertificateIdentity(configurationPath, appleAccount, teams[0], true, true);
++        } catch (Exception e) {
++            log.errorF!"The saved certificate is not valid for this team: %s"(e.msg);
++            return 1;
++        }
++
++        if (gsv) {
++            writefln!"GSV_CERT_VERIFY\t%s\tVALID"(teamId);
++        }
++        return 0;
++    }
+ }
+ 
+ @(Command("history").Description("List locally saved signing certificates without logging in."))
+diff --git a/frontends/cli/source/install.d b/frontends/cli/source/install.d
+index 63a5d65..e0103d1 100644
+--- a/frontends/cli/source/install.d
++++ b/frontends/cli/source/install.d
+@@ -35,6 +35,9 @@ struct InstallCommand
+     @(NamedArgument("reuse-certificate").Description("Require the saved certificate for the selected team; do not create a replacement."))
+     bool reuseCertificate = false;
+ 
++    @(NamedArgument("replace-certificate-if-needed").Description("For a free team, revoke its existing development certificate only when Apple blocks the requested new certificate."))
++    bool replaceCertificateIfNeeded = false;
++
+     @(NamedArgument("gsv").Description("Emit machine-readable progress events for the GSV user interface."))
+     bool gsv = false;
+ 
+@@ -44,6 +47,7 @@ struct InstallCommand
+     int opCall()
+     {
+         enforce(!(newCertificate && reuseCertificate), "--new-certificate and --reuse-certificate cannot be used together.");
++        enforce(!replaceCertificateIfNeeded || newCertificate, "--replace-certificate-if-needed requires --new-certificate.");
+         Application app = openApp(appPath);
+ 
+         auto log = getLogger();
+@@ -92,7 +96,7 @@ struct InstallCommand
+                 progressBar.index = cast(int) (progress * 100);
+                 progressBar.update();
+             }
+-        }, !singlethreaded, teamId, !newCertificate, reuseCertificate);
++        }, !singlethreaded, teamId, !newCertificate, reuseCertificate, replaceCertificateIfNeeded);
+         if (!gsv) {
+             progressBar.finish();
+         }
+diff --git a/source/sideload/certificateidentity.d b/source/sideload/certificateidentity.d
+index ca1f841..dd8c236 100644
+--- a/source/sideload/certificateidentity.d
++++ b/source/sideload/certificateidentity.d
+@@ -2,6 +2,7 @@ module sideload.certificateidentity;
+ 
+ import std.algorithm.searching;
+ import std.digest.sha;
++import std.exception;
+ import file = std.file;
+ import std.path;
+ import std.uni;
+@@ -41,6 +42,7 @@ class CertificateIdentity {
+         DeveloperTeam team,
+         bool reuseExisting = true,
+         bool requireExisting = false,
++        bool replaceExistingIfNeeded = false,
+     ) {
+         auto log = getLogger();
+         scope(success) log.debug_("Certificate retrieved successfully.");
+@@ -98,15 +100,11 @@ class CertificateIdentity {
+                 try {
+                     auto saved = X509Certificate(certFile, false);
+                     if (saved.subjectPublicKey().x509SubjectPublicKey() == ourPublicKey) {
+-                        if (requireExisting) {
+-                            log.info("Using the selected saved development certificate.");
+-                            certificate = saved;
+-                            return;
+-                        }
+                         log.info("Found saved development certificate; verifying it with Apple.");
+                         certificate = saved;
++                    } else {
++                        log.warn("Saved certificate does not match the private key; fetching a matching one.");
+                     }
+-                    log.warn("Saved certificate does not match the private key; fetching a matching one.");
+                 } catch (Exception e) {
+                     log.warnF!"Could not load saved certificate (%s); fetching a matching one."(e.msg);
+                 }
+@@ -119,11 +117,7 @@ class CertificateIdentity {
+                 try {
+                     auto saved = X509Certificate(legacyCertFile, false);
+                     if (saved.subjectPublicKey().x509SubjectPublicKey() == privateKey.x509SubjectPublicKey()) {
+-                        if (requireExisting) {
+-                            log.info("Using the selected legacy development certificate.");
+-                            certificate = saved;
+-                            return;
+-                        }
++                        log.info("Found legacy development certificate; verifying it with Apple.");
+                         certificate = saved;
+                     }
+                 } catch (Exception e) {
+@@ -140,7 +134,11 @@ class CertificateIdentity {
+                 Vector!ubyte certContent = Vector!ubyte(cert.certContent);
+                 auto x509cert = X509Certificate(certContent, false);
+                 if (x509cert.subjectPublicKey().x509SubjectPublicKey() == ourPublicKey) {
+-                    log.info("Reusing the development certificate already registered with this Apple ID.");
++                    if (requireExisting) {
++                        log.info("Using the selected saved development certificate.");
++                    } else {
++                        log.info("Reusing the development certificate already registered with this Apple ID.");
++                    }
+                     certificate = X509Certificate(Vector!ubyte(cert.certContent), false);
+                     persistCertificate();
+                     return;
+@@ -172,7 +170,24 @@ class CertificateIdentity {
+ 
+         log.debug_("Submitting a new certificate request to Apple...");
+ 
+-        auto certificateId = appleAccount.submitDevelopmentCSR!iOS(team, certRequest.PEM_encode()).unwrap();
++        string submitCertificate() {
++            try {
++                return appleAccount.submitDevelopmentCSR!iOS(team, certRequest.PEM_encode()).unwrap();
++            } catch (Exception e) {
++                bool certificateLimitReached = e.msg.canFind("already have a current iOS Development certificate");
++                if (!replaceExistingIfNeeded || team.membershipKind != "free" || !certificateLimitReached) {
++                    throw e;
++                }
++
++                auto certificates = appleAccount.listAllDevelopmentCerts!iOS(team).unwrap();
++                enforce(certificates.length == 1, "Apple blocked certificate creation, but there is no single existing certificate that can be safely replaced.");
++                log.warn("Apple's free team certificate limit was reached; revoking its existing development certificate before creating the requested replacement.");
++                appleAccount.revokeDevelopmentCert!iOS(team, certificates[0]).unwrap();
++                return appleAccount.submitDevelopmentCSR!iOS(team, certRequest.PEM_encode()).unwrap();
++            }
++        }
++
++        auto certificateId = submitCertificate();
+         auto appleCertificateInfo = appleAccount.listAllDevelopmentCerts!iOS(team).unwrap().find!((cert) => cert.certificateId == certificateId)[0];
+         certificate = X509Certificate(Vector!ubyte(appleCertificateInfo.certContent), false);
+         persistCertificate();
+diff --git a/source/sideload/package.d b/source/sideload/package.d
+index f51be79..2baf580 100644
+--- a/source/sideload/package.d
++++ b/source/sideload/package.d
+@@ -37,6 +37,7 @@ void sideloadFull(
+     string selectedTeamId = null,
+     bool reuseCertificate = true,
+     bool requireSavedCertificate = false,
++    bool replaceExistingCertificateIfNeeded = false,
+ ) {
+     enum STEP_COUNT = 9.0;
+     auto log = getLogger();
+@@ -72,7 +73,7 @@ void sideloadFull(
+ 
+     // create a certificate for the developer
+     progressCallback(3 / STEP_COUNT, "Generating a certificate for Sideloader");
+-    auto certIdentity = new CertificateIdentity(configurationPath, developer, team, reuseCertificate, requireSavedCertificate);
++    auto certIdentity = new CertificateIdentity(configurationPath, developer, team, reuseCertificate, requireSavedCertificate, replaceExistingCertificateIfNeeded);
+ 
+     // check if we registered an app id for it (if not create it)
+     progressCallback(4 / STEP_COUNT, "Creating App IDs for the application");

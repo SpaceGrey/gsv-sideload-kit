@@ -1,0 +1,64 @@
+diff --git a/GoodbyeShortVideo/gsv.swift b/GoodbyeShortVideo/gsv.swift
+index a10f9c6..255ab7b 100644
+--- a/GoodbyeShortVideo/gsv.swift
++++ b/GoodbyeShortVideo/gsv.swift
+@@ -442,6 +442,34 @@ func savedCertificates() -> [SavedCertificate] {
+     }
+ }
+ 
++func verifiedSavedCertificates(_ certificates: [SavedCertificate]) -> [SavedCertificate] {
++    guard !certificates.isEmpty else { return [] }
++
++    info(localized("正在验证本地历史签名证书", "Verifying saved signing certificates"))
++    return certificates.filter { certificate in
++        guard let teamID = certificate.teamID else { return false }
++        let logURL = outputURL.appendingPathComponent("gsv-cert-verify-\(teamID).log")
++        do {
++            let status = try runLogged(
++                sideloaderURL.path,
++                ["cert", "verify", "--team", teamID, "--gsv"],
++                logURL: logURL,
++                activity: localized("正在验证历史签名证书…", "Verifying saved signing certificates…")
++            )
++            let result = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
++            let marker = "GSV_CERT_VERIFY\t\(teamID)\tVALID"
++            guard status == 0, result.contains(marker) else {
++                warn(localized("已跳过失效或不属于当前帐号的历史证书（Team ID: \(teamID)）。", "Skipped a saved certificate that is invalid or unavailable for the current account (Team ID: \(teamID))."))
++                return false
++            }
++            return true
++        } catch {
++            warn(localized("无法验证历史证书（Team ID: \(teamID)），不会提供它用于签名。", "Could not verify the saved certificate (Team ID: \(teamID)); it will not be offered for signing."))
++            return false
++        }
++    }
++}
++
+ func chooseCertificateMode(_ certificates: [SavedCertificate]) -> (reuse: Bool, teamID: String?) {
+     guard !certificates.isEmpty else {
+         GSVConsole.note(localized("未发现本地历史证书；稍后会登录 Apple ID 并创建新证书。", "No saved certificate was found. You will sign in to Apple ID and create one shortly."))
+@@ -605,6 +633,7 @@ func install(ipaURL: URL, device: Device, team: Team, reuseSavedCertificate: Boo
+     do {
+         var arguments = ["install", ipaURL.path, "--udid", device.udid, "--team", team.id, "--gsv"]
+         arguments.append(reuseSavedCertificate ? "--reuse-certificate" : "--new-certificate")
++        if !reuseSavedCertificate { arguments.append("--replace-certificate-if-needed") }
+         if !hasSession { arguments.insert("--interactive", at: 1) }
+         var status = try runLogged(
+             sideloaderURL.path,
+@@ -622,6 +651,7 @@ func install(ipaURL: URL, device: Device, team: Team, reuseSavedCertificate: Boo
+             GSVConsole.note(localized("请在当前终端重新输入 Apple ID、密码和双重认证码。", "Re-enter your Apple ID, password, and verification code in this terminal."))
+             var retryArguments = ["install", "--interactive", ipaURL.path, "--udid", device.udid, "--team", team.id, "--gsv"]
+             retryArguments.append(reuseSavedCertificate ? "--reuse-certificate" : "--new-certificate")
++            if !reuseSavedCertificate { retryArguments.append("--replace-certificate-if-needed") }
+             status = try runLogged(
+                 sideloaderURL.path,
+                 retryArguments,
+@@ -741,7 +771,7 @@ func runGSV() {
+     }
+ 
+     GSVConsole.progress(current: 2)
+-    let certificateMode = chooseCertificateMode(savedCertificates())
++    let certificateMode = chooseCertificateMode(verifiedSavedCertificates(savedCertificates()))
+     let team: Team
+     if let historicalTeamID = certificateMode.teamID {
+         team = Team(name: localized("历史证书关联团队", "Team associated with saved certificate"), id: historicalTeamID, membership: "unknown")

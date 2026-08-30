@@ -1,0 +1,15 @@
+*.ipa
+out/
+.DS_Store
+.env
+.env.*
+*.p8
+*.p12
+*.mobileprovision
+*.pem
+*.key
+*.dSYM
+*.xcarchive
+DerivedData/
+xcuserdata/
+*.xcuserstate

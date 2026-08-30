@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+cyan_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+python_bin=/usr/bin/python3
+
+if [ ! -x "$python_bin" ] || ! "$python_bin" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)'; then
+  echo "Bundled Cyan requires the macOS Python 3.9 runtime or later." >&2
+  exit 1
+fi
+
+if [ -n "${PYTHONPATH:-}" ]; then
+  export PYTHONPATH="$cyan_root:$PYTHONPATH"
+else
+  export PYTHONPATH="$cyan_root"
+fi
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+exec "$python_bin" -m cyan "$@"

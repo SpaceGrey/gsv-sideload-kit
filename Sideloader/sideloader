@@ -1,0 +1,6 @@
+#!/bin/bash
+# Project-local Sideloader: static CLI + bundled libimobiledevice.
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export DYLD_LIBRARY_PATH="$DIR/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+exec "$DIR/bin/sideloader" "$@"
